@@ -117,7 +117,7 @@
   function listApps(cb) {
     try {
       tizen.application.getAppsInfo(function (list) {
-        cb(null, list.filter(function (a) { return a.show !== false; }).map(function (a) { return { id: a.id, name: a.name }; }));
+        cb(null, list.filter(function (a) { return a.show !== false; }).map(function (a) { return { id: a.id, name: a.name, icon: !!a.iconPath }; }));
       }, function (e) { cb(e && e.message || 'getAppsInfo hatasi'); });
     } catch (e) { cb(e.message); }
   }
@@ -156,6 +156,36 @@
     watcher = w;
   }
 
+  /* Uygulamanin TV'de kurulu olan kendi simgesini dondurur (launcher kendi logo dosyasi tasimaz). */
+  function sendIcon(id, res) {
+    try {
+      var info = tizen.application.getAppInfo(id);
+      var p = String(info && info.iconPath || '').replace(/^file:\/\//, '');
+      if (!p) return send(res, 404, { error: 'simge yok' });
+      fs.readFile(p, function (err, data) {
+        if (err) return send(res, 404, { error: 'simge okunamadi' });
+        var type = /\.jpe?g$/i.test(p) ? 'image/jpeg' : /\.svg$/i.test(p) ? 'image/svg+xml' : 'image/png';
+        res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'max-age=86400', 'Access-Control-Allow-Origin': ALLOWED_ORIGIN });
+        res.end(data);
+      });
+    } catch (e) { send(res, 404, { error: e.message }); }
+  }
+
+  /* Bir web adresini TV'nin varsayilan tarayicisinda acar. Varsayilan secilemezse Samsung Internet denenir. */
+  function openUrl(url, cb) {
+    try {
+      var ctrl = new tizen.ApplicationControl('http://tizen.org/appcontrol/operation/view', url, null, null, null);
+      tizen.application.launchAppControl(ctrl, null, function () { cb(null); }, function () {
+        tizen.application.getAppsInfo(function (list) {
+          var b = list.filter(function (a) { return /^internet$|browser/i.test(a.name) || /browser/i.test(a.id); })[0];
+          if (!b) return cb('tarayici bulunamadi');
+          var c2 = new tizen.ApplicationControl('http://tizen.org/appcontrol/operation/view', url, null, null, null);
+          tizen.application.launchAppControl(c2, b.id, function () { cb(null); }, function (e) { cb(e && e.message || 'tarayici acilamadi'); });
+        }, function (e) { cb(e && e.message || 'uygulama listesi alinamadi'); });
+      });
+    } catch (e) { cb(e.message); }
+  }
+
   function send(res, code, obj) {
     res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': ALLOWED_ORIGIN });
     res.end(JSON.stringify(obj));
@@ -167,6 +197,7 @@
     var u = require('url').parse(req.url, true), q = u.query;
 
     if (u.pathname === '/ping') return send(res, 200, { ok: true });
+    if (u.pathname === '/icon') return sendIcon(String(q.id || ''), res);
     if (u.pathname === '/apps') return listApps(function (err, apps) { err ? send(res, 500, { error: err }) : send(res, 200, apps); });
     if (u.pathname === '/launch') {
       if (!q.id) return send(res, 400, { error: 'id gerekli' });
@@ -175,6 +206,11 @@
         if (q.back === '1') watchApp(String(q.id));
         send(res, 200, { ok: true });
       });
+    }
+    if (u.pathname === '/open-url') {
+      var target = String(q.url || '');
+      if (!/^https?:\/\/[^\s]+$/i.test(target)) return send(res, 400, { error: 'gecersiz adres' });
+      return openUrl(target, function (err) { err ? send(res, 500, { error: err }) : send(res, 200, { ok: true }); });
     }
     if (u.pathname === '/key') {
       var key = String(q.key || '').replace(/[^A-Z0-9_]/g, '');
