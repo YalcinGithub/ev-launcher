@@ -45,23 +45,44 @@
     return { text: buf.slice(off, off + len).toString('utf8'), rest: buf.slice(off + len) };
   }
 
-  /* TV'nin kumanda kanalina baglanip tek bir tus gonderir. Once 8002 (TLS + token), olmazsa 8001 denenir. */
+  function lanIp() {
+    try {
+      var ifs = require('os').networkInterfaces();
+      for (var n in ifs) {
+        for (var j = 0; j < ifs[n].length; j++) {
+          var a = ifs[n][j];
+          if ((a.family === 'IPv4' || a.family === 4) && !a.internal) return a.address;
+        }
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  var lastKeyError = '';
+
+  /* TV'nin kumanda kanalina baglanip tek bir tus gonderir.
+     Kanal bazi TV'lerde 127.0.0.1'i reddeder; bu yuzden TV'nin ag IP'si de denenir. */
   function sendRemoteKey(key, cb) {
-    var attempts = [{ tls: true, port: 8002 }, { tls: false, port: 8001 }];
+    var hosts = ['127.0.0.1'], ip = lanIp();
+    if (ip) hosts.unshift(ip);
+    var attempts = [];
+    hosts.forEach(function (h) { attempts.push({ host: h, tls: true, port: 8002 }, { host: h, tls: false, port: 8001 }); });
+    var errors = [];
     var finished = false;
     function finish(err) { if (!finished) { finished = true; cb(err); } }
 
     function attempt(i, lastErr) {
-      if (i >= attempts.length) return finish(lastErr || 'baglanti kurulamadi');
+      if (lastErr && i > 0) { var p = attempts[i - 1]; errors.push(p.host + ':' + p.port + ' ' + lastErr); }
+      if (i >= attempts.length) { lastKeyError = errors.join(' | '); return finish(lastErr || 'baglanti kurulamadi'); }
       var a = attempts[i], token = readToken();
       var path = '/api/v2/channels/samsung.remote.control?name=' + REMOTE_NAME + (a.tls && token ? '&token=' + encodeURIComponent(token) : '');
       var opts = {
-        host: '127.0.0.1', port: a.port, path: path, rejectUnauthorized: false,
+        host: a.host, port: a.port, path: path, rejectUnauthorized: false,
         headers: { Connection: 'Upgrade', Upgrade: 'websocket', 'Sec-WebSocket-Version': '13', 'Sec-WebSocket-Key': crypto.randomBytes(16).toString('base64') }
       };
       var done = false;
       var req = (a.tls ? https : http).request(opts);
-      var timer = setTimeout(function () { if (!done) { done = true; try { req.abort(); } catch (e) {} attempt(i + 1, 'zaman asimi (TV ekraninda izin sorusu olabilir)'); } }, 30000);
+      var timer = setTimeout(function () { if (!done) { done = true; try { req.abort(); } catch (e) {} attempt(i + 1, 'zaman asimi (TV ekraninda izin sorusu olabilir)'); } }, a.tls ? 20000 : 8000);
       req.on('error', function (e) { if (!done) { done = true; clearTimeout(timer); attempt(i + 1, e.message); } });
       req.on('response', function (res) { if (!done) { done = true; clearTimeout(timer); attempt(i + 1, 'HTTP ' + res.statusCode); } });
       req.on('upgrade', function (res, socket, head) {
@@ -107,6 +128,34 @@
     } catch (e) { cb(e.message); }
   }
 
+  function selfAppId() {
+    try { return tizen.application.getCurrentApplication().appInfo.id; } catch (e) { return null; }
+  }
+
+  /* Launcher'dan acilan uygulama kapaninca TizenBrew'u (ve dolayisiyla launcher'i) tekrar one getirir. */
+  var watcher = null;
+  function watchApp(id) {
+    if (watcher) clearInterval(watcher.timer);
+    var w = { seen: false, started: Date.now() };
+    w.timer = setInterval(function () {
+      if (Date.now() - w.started > 8 * 3600 * 1000) { clearInterval(w.timer); return; }
+      try {
+        tizen.application.getAppsContext(function (ctxs) {
+          var running = ctxs.some(function (c) { return c.appId === id; });
+          if (running) { w.seen = true; return; }
+          if (w.seen || Date.now() - w.started > 30000) {
+            clearInterval(w.timer); watcher = null;
+            if (w.seen) {
+              var me = selfAppId();
+              if (me) setTimeout(function () { try { tizen.application.launch(me, function () {}, function (e) { log('geri donus: ' + (e && e.message)); }); } catch (e) {} }, 700);
+            }
+          }
+        }, function () {});
+      } catch (e) { clearInterval(w.timer); watcher = null; }
+    }, 2000);
+    watcher = w;
+  }
+
   function send(res, code, obj) {
     res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': ALLOWED_ORIGIN });
     res.end(JSON.stringify(obj));
@@ -121,12 +170,16 @@
     if (u.pathname === '/apps') return listApps(function (err, apps) { err ? send(res, 500, { error: err }) : send(res, 200, apps); });
     if (u.pathname === '/launch') {
       if (!q.id) return send(res, 400, { error: 'id gerekli' });
-      return launchApp(String(q.id), function (err) { err ? send(res, 500, { error: err }) : send(res, 200, { ok: true }); });
+      return launchApp(String(q.id), function (err) {
+        if (err) return send(res, 500, { error: err });
+        if (q.back === '1') watchApp(String(q.id));
+        send(res, 200, { ok: true });
+      });
     }
     if (u.pathname === '/key') {
       var key = String(q.key || '').replace(/[^A-Z0-9_]/g, '');
       if (!/^KEY_/.test(key)) return send(res, 400, { error: 'gecersiz tus' });
-      return sendRemoteKey(key, function (err) { err ? send(res, 500, { error: err }) : send(res, 200, { ok: true }); });
+      return sendRemoteKey(key, function (err) { err ? send(res, 500, { error: err, detail: lastKeyError }) : send(res, 200, { ok: true }); });
     }
     send(res, 404, { error: 'bulunamadi' });
   });
